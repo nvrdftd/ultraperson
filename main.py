@@ -1,9 +1,7 @@
 import asyncio
-from http import client
 import os
 import json
 from dotenv import load_dotenv
-from pydantic import BaseModel
 from openai import OpenAI
 
 load_dotenv()
@@ -81,11 +79,14 @@ async def call_llm(user_input: str, conversation_history: list):
             elif event.type == "response.in_progress":
                 yield "."
             elif event.type == "response.output_item.added":
-                tool_calls[event.output_index] = event.item
+                item = event.item
+                if getattr(item, "type", None) == "function_call" and getattr(item, "arguments", None) is None:
+                    item.arguments = ""
+                tool_calls[event.output_index] = item
             elif event.type == "response.function_call_arguments.delta":
                 index = event.output_index
-                if tool_calls[index]:
-                    tool_calls[index].arguments += event.delta
+                if index in tool_calls:
+                    tool_calls[index].arguments = (tool_calls[index].arguments or "") + event.delta
 
         # Filter tool calls to only include function calls
         tool_calls = {k: v for k, v in tool_calls.items() if v.type == "function_call"}
@@ -159,8 +160,6 @@ async def main():
         async for chunk in call_llm(user_input, conversation_history):
             print(chunk, end='', flush=True)
         print()
-    
-    print(conversation_history)
 
 if __name__ == "__main__":
     asyncio.run(main())
