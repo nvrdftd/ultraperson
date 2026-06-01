@@ -4,7 +4,7 @@ import os
 import signal
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from tools_api import ToolAPIClient
 
@@ -109,8 +109,7 @@ async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClie
         first_token_printed = False
 
         try:
-            stream = await asyncio.to_thread(
-                client.responses.create,
+            stream = await client.responses.create(
                 model=os.environ.get("MODEL", "gpt-5.4-mini"),
                 tools=tools,
                 instructions="You are an assistant that helps answer questions. You can call tools to get information when needed." \
@@ -120,11 +119,7 @@ async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClie
                 stream=True,
             )
 
-            while True:
-                event = await asyncio.to_thread(next, stream, None)
-                if event is None:
-                    break
-
+            async for event in stream:
                 # Handle response events
                 if event.type == "response.output_text.delta":
                     if not first_token_printed:
@@ -143,10 +138,10 @@ async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClie
                     if index in tool_calls:
                         tool_calls[index].arguments = (tool_calls[index].arguments or "") + event.delta
         except asyncio.CancelledError:
-            # Close the SSE stream so the worker thread and TCP socket are released.
+            # Close the SSE stream so the upstream TCP socket is released.
             if stream is not None:
                 try:
-                    stream.close()
+                    await stream.close()
                 except Exception:
                     pass
             raise
@@ -170,7 +165,7 @@ async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClie
                 "content": "".join(response_output),
             })
 
-    client = OpenAI()
+    client = AsyncOpenAI()
     async for chunk in generate_stream(client, conversation_history):
         yield chunk
 
