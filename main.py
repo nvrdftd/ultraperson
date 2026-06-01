@@ -177,6 +177,7 @@ async def handle_tool_calls(tool_calls: dict, tool_calls_inputs: list, api: Tool
 
     for _, item in tool_calls.items():
         if item.type == "function_call":
+            spinner.update(f"Calling {item.name}...")
             try:
                 args = json.loads(item.arguments or "{}")
                 call_output = await call_tool(item.name, args, api)
