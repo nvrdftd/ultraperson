@@ -1,6 +1,8 @@
 import asyncio
-import os
 import json
+import os
+import signal
+
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -42,8 +44,8 @@ tools = [
 ]
 
 async def get_user_input() -> str:
-    """Get input from user."""
-    return input("You: ")
+    """Get input from user without blocking the event loop."""
+    return await asyncio.to_thread(input, "You: ")
 
 async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClient):
     """Send input to LLM, handle tool calls, yield streaming response."""
@@ -55,40 +57,54 @@ async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClie
     async def generate_stream(client, context):
         """Generate streaming response from LLM."""
 
-        stream = client.responses.create(
-            model=os.environ.get("MODEL", "gpt-5.4-mini"),
-            tools=tools,
-            instructions="You are an assistant that helps answer questions. You can call tools to get information when needed." \
-            "Don't call a tool if you don't need to. If you call a tool, make sure to use the information it returns in your response." \
-            "Perhaps you have used the tool before and it is in the conversation history, so check there before calling a tool.",
-            input=context,
-            stream=True
-        )
-
         tool_calls = {}
         response_output = []
+        stream = None
 
-        for event in stream:
+        try:
+            stream = await asyncio.to_thread(
+                client.responses.create,
+                model=os.environ.get("MODEL", "gpt-5.4-mini"),
+                tools=tools,
+                instructions="You are an assistant that helps answer questions. You can call tools to get information when needed." \
+                "Don't call a tool if you don't need to. If you call a tool, make sure to use the information it returns in your response." \
+                "Perhaps you have used the tool before and it is in the conversation history, so check there before calling a tool.",
+                input=context,
+                stream=True,
+            )
 
-            # Handle response events
-            if event.type == "response.created":
-                yield "Assistant: "
-            elif event.type == "response.output_text.delta":
-                response_output.append(event.delta)
-                yield event.delta
-            elif event.type == "response.error":
-                yield "Oops, something went wrong. Please try again."
-            elif event.type == "response.in_progress":
-                yield "."
-            elif event.type == "response.output_item.added":
-                item = event.item
-                if getattr(item, "type", None) == "function_call" and getattr(item, "arguments", None) is None:
-                    item.arguments = ""
-                tool_calls[event.output_index] = item
-            elif event.type == "response.function_call_arguments.delta":
-                index = event.output_index
-                if index in tool_calls:
-                    tool_calls[index].arguments = (tool_calls[index].arguments or "") + event.delta
+            while True:
+                event = await asyncio.to_thread(next, stream, None)
+                if event is None:
+                    break
+
+                # Handle response events
+                if event.type == "response.created":
+                    yield "Assistant: "
+                elif event.type == "response.output_text.delta":
+                    response_output.append(event.delta)
+                    yield event.delta
+                elif event.type == "response.error":
+                    yield "Oops, something went wrong. Please try again."
+                elif event.type == "response.in_progress":
+                    yield "."
+                elif event.type == "response.output_item.added":
+                    item = event.item
+                    if getattr(item, "type", None) == "function_call" and getattr(item, "arguments", None) is None:
+                        item.arguments = ""
+                    tool_calls[event.output_index] = item
+                elif event.type == "response.function_call_arguments.delta":
+                    index = event.output_index
+                    if index in tool_calls:
+                        tool_calls[index].arguments = (tool_calls[index].arguments or "") + event.delta
+        except asyncio.CancelledError:
+            # Close the SSE stream so the worker thread and TCP socket are released.
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            raise
 
         # Filter tool calls to only include function calls
         tool_calls = {k: v for k, v in tool_calls.items() if v.type == "function_call"}
@@ -149,20 +165,44 @@ async def research_topic(topic: str, api: ToolAPIClient) -> dict:
 
 async def main():
     conversation_history = []
+    loop = asyncio.get_running_loop()
+    turn_task: asyncio.Task | None = None
+
+    def on_sigint() -> None:
+        if turn_task and not turn_task.done():
+            turn_task.cancel()
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, on_sigint)
+    except NotImplementedError:
+        pass  # Windows falls back to default KeyboardInterrupt.
 
     async with ToolAPIClient() as api:
         while True:
-            user_input = await get_user_input()
+            try:
+                user_input = await get_user_input()
+            except EOFError:
+                print()
+                break
             if user_input.lower() in ['quit', 'exit', 'q']:
                 break
 
-            # How do you handle cancellation while streaming?
-            # client.responses.cancel
+            async def _drain_turn() -> None:
+                async for chunk in call_llm(user_input, conversation_history, api):
+                    print(chunk, end='', flush=True)
+                print()
 
-            # How do you show pending state during slow tool calls?
-            async for chunk in call_llm(user_input, conversation_history, api):
-                print(chunk, end='', flush=True)
-            print()
+            turn_task = asyncio.create_task(_drain_turn())
+            try:
+                await turn_task
+            except asyncio.CancelledError:
+                print("\n[cancelled]")
+            finally:
+                turn_task = None
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
