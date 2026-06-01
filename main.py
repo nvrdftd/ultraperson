@@ -43,6 +43,50 @@ tools = [
     }
 ]
 
+class Spinner:
+    """Single-line animated status indicator."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    INTERVAL = 0.08
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task | None = None
+        self._text: str = ""
+
+    def start(self, text: str) -> None:
+        self._text = text
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    def update(self, text: str) -> None:
+        self._text = text
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._task = None
+        print("\r\033[2K", end="", flush=True)
+
+    async def _run(self) -> None:
+        try:
+            i = 0
+            while True:
+                print(f"\r\033[2K{self.FRAMES[i % len(self.FRAMES)]} {self._text}", end="", flush=True)
+                i += 1
+                await asyncio.sleep(self.INTERVAL)
+        except asyncio.CancelledError:
+            return
+
+
+spinner = Spinner()
+
+
 async def get_user_input() -> str:
     """Get input from user without blocking the event loop."""
     return await asyncio.to_thread(input, "You: ")
@@ -57,9 +101,12 @@ async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClie
     async def generate_stream(client, context):
         """Generate streaming response from LLM."""
 
+        spinner.start("Thinking...")
+
         tool_calls = {}
         response_output = []
         stream = None
+        first_token_printed = False
 
         try:
             stream = await asyncio.to_thread(
@@ -79,15 +126,13 @@ async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClie
                     break
 
                 # Handle response events
-                if event.type == "response.created":
-                    yield "Assistant: "
-                elif event.type == "response.output_text.delta":
+                if event.type == "response.output_text.delta":
+                    if not first_token_printed:
+                        await spinner.stop()
+                        yield "Assistant: "
+                        first_token_printed = True
                     response_output.append(event.delta)
                     yield event.delta
-                elif event.type == "response.error":
-                    yield "Oops, something went wrong. Please try again."
-                elif event.type == "response.in_progress":
-                    yield "."
                 elif event.type == "response.output_item.added":
                     item = event.item
                     if getattr(item, "type", None) == "function_call" and getattr(item, "arguments", None) is None:
@@ -110,7 +155,6 @@ async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClie
         tool_calls = {k: v for k, v in tool_calls.items() if v.type == "function_call"}
 
         if tool_calls:
-            yield "Let me use tools to find the answer...\n"
             tool_calls_context = [conversation_history[-1]]  # Pass the previous user input to tool calls
             await handle_tool_calls(tool_calls, tool_calls_context, api)
             async for chunk in generate_stream(client, tool_calls_context):
@@ -196,6 +240,7 @@ async def main():
             try:
                 await turn_task
             except asyncio.CancelledError:
+                await spinner.stop()
                 print("\n[cancelled]")
             finally:
                 turn_task = None
