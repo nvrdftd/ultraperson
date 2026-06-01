@@ -4,6 +4,8 @@ import json
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from tools_api import ToolAPIClient
+
 load_dotenv()
 
 tools = [
@@ -43,7 +45,7 @@ async def get_user_input() -> str:
     """Get input from user."""
     return input("You: ")
 
-async def call_llm(user_input: str, conversation_history: list):
+async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClient):
     """Send input to LLM, handle tool calls, yield streaming response."""
     conversation_history.append({
         "role": "user",
@@ -94,7 +96,7 @@ async def call_llm(user_input: str, conversation_history: list):
         if tool_calls:
             yield "Let me use tools to find the answer...\n"
             tool_calls_context = [conversation_history[-1]]  # Pass the previous user input to tool calls
-            await handle_tool_calls(tool_calls, tool_calls_context)
+            await handle_tool_calls(tool_calls, tool_calls_context, api)
             async for chunk in generate_stream(client, tool_calls_context):
                 yield chunk
 
@@ -108,7 +110,7 @@ async def call_llm(user_input: str, conversation_history: list):
     async for chunk in generate_stream(client, conversation_history):
         yield chunk
 
-async def handle_tool_calls(tool_calls: dict, tool_calls_inputs: list):
+async def handle_tool_calls(tool_calls: dict, tool_calls_inputs: list, api: ToolAPIClient):
 
     tool_calls_inputs.extend(list(tool_calls.values()))
 
@@ -116,7 +118,7 @@ async def handle_tool_calls(tool_calls: dict, tool_calls_inputs: list):
 
     for _, item in tool_calls.items():
         if item.type == "function_call":
-            call_output = await call_tool(item.name, json.loads(item.arguments))
+            call_output = await call_tool(item.name, json.loads(item.arguments or "{}"), api)
             tool_call_outputs.append({
                 "type": "function_call_output",
                 "call_id": item.call_id,
@@ -125,41 +127,42 @@ async def handle_tool_calls(tool_calls: dict, tool_calls_inputs: list):
 
     tool_calls_inputs.extend(tool_call_outputs)
 
-async def call_tool(tool_name: str, arguments: dict) -> str:
-    """Call a tool by name with arguments, return output as string."""
+async def call_tool(tool_name: str, arguments: dict, api: ToolAPIClient) -> str:
+    """Call a tool by name with arguments, return output as JSON string."""
     if tool_name == "get_weather":
         location = arguments["location"]
-        weather = await get_weather(location)
+        weather = await get_weather(location, api)
         return json.dumps(weather)
 
     elif tool_name == "research_topic":
         topic = arguments["topic"]
-        research = await research_topic(topic)
+        research = await research_topic(topic, api)
         return json.dumps(research)
 
-async def get_weather(location: str) -> dict:
-    """Fetch weather from API (~200ms)."""
-    return {"location": location, "weather": "sunny", "temperature": 25}
+async def get_weather(location: str, api: ToolAPIClient) -> dict:
+    """Fetch current weather for a city from the upstream service."""
+    return await api.get_weather(location)
 
-async def research_topic(topic: str) -> dict:
-    """Research a topic (3-8 seconds). Should be cancellable."""
-    return {"topic": topic, "research": "Detailed research on the topic."}
+async def research_topic(topic: str, api: ToolAPIClient) -> dict:
+    """Run an in-depth research call against the upstream service (3-8 s)."""
+    return await api.research_topic(topic)
 
 async def main():
     conversation_history = []
 
-    while True:
-        user_input = await get_user_input()
-        if user_input.lower() in ['quit', 'exit', 'q']:
-            break
+    async with ToolAPIClient() as api:
+        while True:
+            user_input = await get_user_input()
+            if user_input.lower() in ['quit', 'exit', 'q']:
+                break
 
-        # How do you handle cancellation while streaming?
-        # client.responses.cancel
+            # How do you handle cancellation while streaming?
+            # client.responses.cancel
 
-        # How do you show pending state during slow tool calls?
-        async for chunk in call_llm(user_input, conversation_history):
-            print(chunk, end='', flush=True)
-        print()
+            # How do you show pending state during slow tool calls?
+            async for chunk in call_llm(user_input, conversation_history, api):
+                print(chunk, end='', flush=True)
+            print()
 
 if __name__ == "__main__":
     asyncio.run(main())
