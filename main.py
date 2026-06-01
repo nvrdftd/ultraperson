@@ -150,6 +150,10 @@ async def call_llm(user_input: str, conversation_history: list, api: ToolAPIClie
                 except Exception:
                     pass
             raise
+        except Exception as e:
+            await spinner.stop()
+            yield f"\n[llm error] {type(e).__name__}: {e}\n"
+            return
 
         # Filter tool calls to only include function calls
         tool_calls = {k: v for k, v in tool_calls.items() if v.type == "function_call"}
@@ -178,7 +182,13 @@ async def handle_tool_calls(tool_calls: dict, tool_calls_inputs: list, api: Tool
 
     for _, item in tool_calls.items():
         if item.type == "function_call":
-            call_output = await call_tool(item.name, json.loads(item.arguments or "{}"), api)
+            try:
+                args = json.loads(item.arguments or "{}")
+                call_output = await call_tool(item.name, args, api)
+            except json.JSONDecodeError:
+                call_output = json.dumps({"ok": False, "error": "bad_arguments"})
+            except Exception as e:
+                call_output = json.dumps({"ok": False, "error": f"tool_exception: {type(e).__name__}"})
             tool_call_outputs.append({
                 "type": "function_call_output",
                 "call_id": item.call_id,
@@ -198,6 +208,8 @@ async def call_tool(tool_name: str, arguments: dict, api: ToolAPIClient) -> str:
         topic = arguments["topic"]
         research = await research_topic(topic, api)
         return json.dumps(research)
+
+    return json.dumps({"ok": False, "error": f"unknown_tool: {tool_name}"})
 
 async def get_weather(location: str, api: ToolAPIClient) -> dict:
     """Fetch current weather for a city from the upstream service."""
@@ -242,6 +254,9 @@ async def main():
             except asyncio.CancelledError:
                 await spinner.stop()
                 print("\n[cancelled]")
+            except Exception as e:
+                await spinner.stop()
+                print(f"\n[error] {type(e).__name__}: {e}")
             finally:
                 turn_task = None
 
